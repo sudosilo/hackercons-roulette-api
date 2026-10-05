@@ -191,7 +191,7 @@ async function resolve(rec) {
 
 async function randomPlayable(source) {
   for (let tries = 0; tries < 10; tries++) {
-    const ids = await redis.sRandMember(K_IDS, 20);
+    const ids = await redis.sRandMemberCount(K_IDS, 20);
     if (!ids || !ids.length) return null;
     for (const id of ids) {
       if (await redis.sIsMember(K_DEAD, id)) continue;
@@ -252,7 +252,7 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/quiz') {
       const rec = await randomPlayable('any');
       if (!rec) return send(res, 503, { error: 'catalog is empty or still loading' });
-      const others = (await redis.sRandMember(K_CONFS, 12) || []).filter(c => c !== rec.conference);
+      const others = (await redis.sRandMemberCount(K_CONFS, 12) || []).filter(c => c !== rec.conference);
       const choices = pickRandom([rec.conference].concat(pickRandom(others, 3)), 4);
       return send(res, 200, { clip: rec, choices });
     }
