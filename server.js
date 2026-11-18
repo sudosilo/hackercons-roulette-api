@@ -19,6 +19,14 @@ const K_IDS = 'hcr:ids';          // set of all ids
 const K_DEAD = 'hcr:dead';        // set of ids that failed to play
 const K_CONFS = 'hcr:confs';      // set of conference names
 const K_MP4 = 'hcr:mp4:';         // prefix, cached playable url per id
+const K_FRESH = 'hcr:fresh';      // set of ids from the last two calendar years
+
+// A talk counts as fresh when its year is this year or one of the two before it.
+function freshCutoff() { return new Date().getFullYear() - 2; }
+function isFresh(rec) {
+  const y = parseInt(String(rec.year || '').slice(0, 4), 10);
+  return Number.isFinite(y) && y >= freshCutoff();
+}
 
 const redis = createClient({ url: REDIS_URL });
 redis.on('error', e => console.log('redis error', e.message));
@@ -37,6 +45,20 @@ async function saveRecord(rec) {
   await redis.hSet(K_ITEMS, rec.id, JSON.stringify(rec));
   await redis.sAdd(K_IDS, rec.id);
   if (rec.conference) await redis.sAdd(K_CONFS, rec.conference);
+  if (isFresh(rec)) await redis.sAdd(K_FRESH, rec.id);
+}
+
+// Rebuilds the fresh set from every stored record, so old catalogs get it too.
+async function rebuildFresh() {
+  const all = await redis.hGetAll(K_ITEMS);
+  await redis.del(K_FRESH);
+  let n = 0;
+  for (const id of Object.keys(all)) {
+    try {
+      if (isFresh(JSON.parse(all[id]))) { await redis.sAdd(K_FRESH, id); n++; }
+    } catch (e) {}
+  }
+  console.log('fresh talks', n);
 }
 
 function pickRandom(arr, n) {
@@ -53,7 +75,8 @@ async function ingestArchive() {
   let total = 0;
   for (let page = 1; page <= 5; page++) {
     const url = 'https://archive.org/advancedsearch.php?q=collection%3Ahackercons+AND+mediatype%3Amovies'
-      + '&fl[]=identifier&fl[]=title&fl[]=year&fl[]=date&rows=500&page=' + page + '&output=json';
+      + '&fl[]=identifier&fl[]=title&fl[]=year&fl[]=date&fl[]=addeddate'
+      + '&sort[]=addeddate+desc&rows=500&page=' + page + '&output=json';
     const j = await getJson(url);
     const docs = (j.response && j.response.docs) || [];
     if (!docs.length) break;
@@ -92,7 +115,11 @@ async function resolveArchive(identifier) {
 // SOURCE 2: media.ccc.de (Chaos Computer Club and related events)
 async function ingestCCC() {
   const j = await getJson('https://api.media.ccc.de/public/conferences');
-  const confs = pickRandom(j.conferences || [], 40);
+  const all = (j.conferences || []).slice();
+  const stamp = c => Date.parse(c.event_last_released_at || c.updated_at || '') || 0;
+  all.sort((a, b) => stamp(b) - stamp(a));
+  const newest = all.slice(0, 15);
+  const confs = newest.concat(pickRandom(all.slice(15), 25));
   let total = 0;
   for (const c of confs) {
     try {
@@ -175,6 +202,7 @@ async function ingestAll() {
   for (const fn of [ingestArchive, ingestCCC, ingestPeerTube]) {
     try { await fn(); } catch (err) { console.log('source failed', fn.name, err.message); }
   }
+  await rebuildFresh();
   console.log('ingest done, total', await redis.sCard(K_IDS));
 }
 
@@ -189,9 +217,11 @@ async function resolve(rec) {
   return url;
 }
 
-async function randomPlayable(source) {
+async function randomPlayable(source, fresh) {
+  // Fresh mode draws from recent talks when there are enough of them.
+  const pool = (fresh && (await redis.sCard(K_FRESH)) >= 20) ? K_FRESH : K_IDS;
   for (let tries = 0; tries < 10; tries++) {
-    const ids = await redis.sRandMemberCount(K_IDS, 20);
+    const ids = await redis.sRandMemberCount(pool, 20);
     if (!ids || !ids.length) return null;
     for (const id of ids) {
       if (await redis.sIsMember(K_DEAD, id)) continue;
@@ -235,7 +265,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
 
     if (u.pathname === '/api/health') {
-      return send(res, 200, { ok: true, items: await redis.sCard(K_IDS), dead: await redis.sCard(K_DEAD) });
+      return send(res, 200, {
+        ok: true,
+        items: await redis.sCard(K_IDS),
+        fresh: await redis.sCard(K_FRESH),
+        dead: await redis.sCard(K_DEAD)
+      });
     }
 
     if (u.pathname === '/api/sources') {
@@ -244,13 +279,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/random') {
-      const rec = await randomPlayable(u.searchParams.get('source') || 'any');
+      const rec = await randomPlayable(u.searchParams.get('source') || 'any', u.searchParams.get('fresh') === '1');
       if (!rec) return send(res, 503, { error: 'catalog is empty or still loading' });
       return send(res, 200, rec);
     }
 
     if (u.pathname === '/api/quiz') {
-      const rec = await randomPlayable('any');
+      const rec = await randomPlayable('any', u.searchParams.get('fresh') === '1');
       if (!rec) return send(res, 503, { error: 'catalog is empty or still loading' });
       const others = (await redis.sRandMemberCount(K_CONFS, 12) || []).filter(c => c !== rec.conference);
       const choices = pickRandom([rec.conference].concat(pickRandom(others, 3)), 4);
@@ -276,6 +311,8 @@ const server = http.createServer(async (req, res) => {
   await redis.connect();
   server.listen(PORT, () => console.log('listening on', PORT));
   const count = await redis.sCard(K_IDS);
-  if (count < 50) ingestAll();
+  // A full ingest pulls the newest talks; a small catalog or an old one gets it right away.
+  if (count < 50 || (await redis.sCard(K_FRESH)) < 20) ingestAll();
+  else rebuildFresh();
   setInterval(ingestAll, INGEST_EVERY_MS);
 })();
