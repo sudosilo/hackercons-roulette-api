@@ -6,6 +6,6 @@ It collects conference talks from several open sources and stores them in a cata
 
 The repo is checked every morning by Control Troll.
 
-Latest change: Created the clip catalog backend. A fix the same day made the random pick truly random.
+Latest change. Newest talks now come first. Added a fresh talk pool and a fresh filter.
 
 See CHANGELOG.md for the full history.
